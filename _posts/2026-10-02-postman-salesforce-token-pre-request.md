@@ -52,10 +52,8 @@ Request disparado
       ▼
 Pre-request da collection
       │
-      ├── Existe token e foi validado há pouco? ──► segue
-      │
       ├── Existe token? ──► GET /services/oauth2/userinfo
-      │                         ├── 200 ──► marca validado, segue
+      │                         ├── 200 ──► reaproveita, segue
       │                         └── 401 ──► gera novo token
       │
       └── Não existe token ──► POST /services/oauth2/token
@@ -65,11 +63,10 @@ Pre-request da collection
 Request sai com Authorization: Bearer {{sf_access_token}}
 ```
 
-Três decisões de design sustentam esse fluxo:
+Duas decisões de design sustentam esse fluxo:
 
-1. **Validação na fonte, não por relógio.** Em vez de assumir que o token vale por X minutos, o script pergunta à Salesforce. Isso cobre sessões revogadas, políticas de timeout diferentes por org e tokens invalidados por mudanças no app.
-2. **Janela de validação.** Chamar o `userinfo` antes de todo request dobraria o número de chamadas. O script só revalida se a última validação tiver mais de alguns minutos.
-3. **Ambiente parametrizado.** O mesmo script serve para DEV, UAT e PRD. Uma única variável (`sf_env`) define de onde vêm as credenciais.
+1. **Validação na fonte, não por relógio.** Em vez de assumir que o token vale por X minutos, o script pergunta à Salesforce antes de cada request. Isso cobre sessões revogadas, políticas de timeout diferentes por org e tokens invalidados por mudanças no app, casos em que qualquer cache baseado em tempo erraria.
+2. **Ambiente parametrizado.** O mesmo script serve para DEV, UAT e PRD. Uma única variável (`sf_env`) define de onde vêm as credenciais.
 
 ## 4. Pré-requisitos na Salesforce
 
@@ -99,7 +96,9 @@ O script cria e mantém sozinho estas três:
 |---|---|
 | `sf_access_token` | Token atual |
 | `sf_instance_url` | URL da instância retornada pela Salesforce |
-| `sf_token_checked_at` | Timestamp da última validação |
+| `sf_token_checked_at` | Data e hora da última validação ou emissão do token |
+
+O `sf_token_checked_at` é só um registro: não decide nada no script. Ele ajuda no troubleshooting, mostrando no environment quando o token foi confirmado pela última vez.
 
 Para adicionar PRD, basta um novo environment com `sf_env = prd` e as variáveis `prd_url`, `prd_key` e `prd_sec`. O script não muda.
 
@@ -109,80 +108,67 @@ Cole no Pre-request Script da **collection** (não do request):
 
 ```javascript
 /**
- * Salesforce OAuth 2.0 - Client Credentials
- * Obtém, reaproveita e valida o token antes de cada request da collection.
+ * Pre-request da collection: token Salesforce via Client Credentials.
+ * Valida o token na Salesforce antes de cada request e só gera outro quando necessário.
+ * Não depende do helper "OAuth 2.0" da aba Authorization do Postman.
  */
 
-const VALIDATION_WINDOW_MS = 5 * 60 * 1000; // revalida no máximo a cada 5 min
-
-const env    = pm.environment.get("sf_env") || "uat";
-const url    = pm.environment.get(`${env}_url`);
-const key    = pm.environment.get(`${env}_key`);
+const env = pm.environment.get("sf_env") || "uat";
+const url = pm.environment.get(`${env}_url`);
+const key = pm.environment.get(`${env}_key`);
 const secret = pm.environment.get(`${env}_sec`);
 
 if (!url || !key || !secret) {
-    throw new Error(`Defina ${env}_url, ${env}_key e ${env}_sec no environment.`);
+  throw new Error(`Defina ${env}_url, ${env}_key e ${env}_sec no environment.`);
 }
 
 async function tokenValido(token, instanceUrl) {
-    const res = await pm.sendRequest({
-        url: `${instanceUrl}/services/oauth2/userinfo`,
-        method: "GET",
-        header: { Authorization: `Bearer ${token}` }
-    });
-    return res.code === 200;
+  if (!token || !instanceUrl) return false;
+
+  const res = await pm.sendRequest({
+    url: `${instanceUrl}/services/oauth2/userinfo`,
+    method: "GET",
+    header: { Authorization: `Bearer ${token}` }
+  });
+
+  return res.code === 200;
 }
 
 async function novoToken() {
-    const res = await pm.sendRequest({
-        url: `${url}/services/oauth2/token`,
-        method: "POST",
-        header: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: {
-            mode: "urlencoded",
-            urlencoded: [
-                { key: "grant_type",    value: "client_credentials" },
-                { key: "client_id",     value: key },
-                { key: "client_secret", value: secret }
-            ]
-        }
-    });
-
-    const body = res.json();
-    if (res.code !== 200) {
-        throw new Error(`[${env}] Falha no token: ${body.error} - ${body.error_description}`);
+  const res = await pm.sendRequest({
+    url: `${url}/services/oauth2/token`,
+    method: "POST",
+    header: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: {
+      mode: "urlencoded",
+      urlencoded: [
+        { key: "grant_type", value: "client_credentials" },
+        { key: "client_id", value: key },
+        { key: "client_secret", value: secret }
+      ]
     }
+  });
 
-    pm.environment.set("sf_access_token", body.access_token);
-    pm.environment.set("sf_instance_url", body.instance_url);
-    pm.environment.set("sf_token_checked_at", Date.now());
-    console.log(`[${env}] Novo token gerado.`);
+  const body = res.json();
+  if (res.code !== 200) {
+    throw new Error(`[${env}] Falha no token: ${body.error} - ${body.error_description}`);
+  }
+
+  pm.environment.set("sf_access_token", body.access_token);
+  pm.environment.set("sf_instance_url", body.instance_url);
+  console.log(`[${env}] Novo token Salesforce gerado.`);
 }
 
-async function garantirToken() {
-    const token       = pm.environment.get("sf_access_token");
-    const instanceUrl = pm.environment.get("sf_instance_url");
-    const checkedAt   = Number(pm.environment.get("sf_token_checked_at") || 0);
+const token = pm.environment.get("sf_access_token");
+const instanceUrl = pm.environment.get("sf_instance_url");
 
-    if (!token || !instanceUrl) {
-        return novoToken();
-    }
-
-    if (Date.now() - checkedAt < VALIDATION_WINDOW_MS) {
-        return; // validado recentemente, confia no cache
-    }
-
-    if (await tokenValido(token, instanceUrl)) {
-        pm.environment.set("sf_token_checked_at", Date.now());
-        console.log(`[${env}] Token válido, reaproveitando.`);
-        return;
-    }
-
-    console.log(`[${env}] Token expirado ou revogado.`);
-    return novoToken();
+if (await tokenValido(token, instanceUrl)) {
+  console.log(`[${env}] Token Salesforce válido, reaproveitando.`);
+} else {
+  await novoToken();
 }
 
-await garantirToken();
+pm.environment.set("sf_token_checked_at", new Date().toISOString());
 ```
 
 ### Por que `async/await`
@@ -193,9 +179,9 @@ await garantirToken();
 
 É o endpoint mais barato para checar um token: responde rápido, retorna `401` quando a sessão não é mais válida e não depende de nenhum objeto ou permissão específica. Funciona como um "ping autenticado".
 
-### Por que a janela de validação
+### O custo da validação
 
-Para uso interativo, 5 minutos é confortável: o token é revalidado poucas vezes por hora. Para o Collection Runner com centenas de requests, uma janela maior reduz ainda mais as chamadas ao `userinfo`. Se o token cair dentro da janela, o request recebe `401` e a próxima revalidação gera um novo.
+Validar antes de cada request significa uma chamada extra ao `userinfo` por request. É uma troca consciente: essa chamada é leve, e em troca nenhum request sai com um token que a Salesforce já invalidou. Em execuções muito grandes no Collection Runner, essas chamadas extras entram na contagem de chamadas de API da org, o que vale considerar.
 
 ### Trocando de ambiente
 
@@ -271,8 +257,7 @@ Como o script repassa o `error` e o `error_description` da Salesforce, a mensage
 | `invalid_grant` / *no client credentials user enabled* | Usuário *Run As* não definido no app | Configurar o *Run As* nas políticas do app |
 | `invalid_client_id` | Consumer Key errada ou de outra org | Conferir a chave e se o app pertence à org de `{env}_url` |
 | `invalid_client` / *invalid client credentials* | Consumer Secret errado, ou app recém-criado ainda propagando | Conferir o secret; em apps novos, aguardar alguns minutos |
-| `401 INVALID_SESSION_ID` na chamada da API | Token caiu dentro da janela de validação | Reexecutar; a próxima revalidação gera um token novo |
-| Erro "Defina uat_url, uat_key..." | Environment errado selecionado ou `sf_env` com outro prefixo | Conferir o environment ativo e o valor de `sf_env` |
+| Erro "Defina uat_url, uat_key e uat_sec..." | Environment errado selecionado ou `sf_env` com outro prefixo | Conferir o environment ativo e o valor de `sf_env` |
 
 ## 9. Antes e depois
 
