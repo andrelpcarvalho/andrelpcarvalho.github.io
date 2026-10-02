@@ -3,23 +3,21 @@ layout: post
 title: "Postman para APIs Salesforce: autenticação automática com Pre-request Scripts"
 date: 2026-10-02
 author: André Carvalho
-tags: [salesforce, postman, oauth, devops, api]
-description: "Como centralizar a obtenção e validação do token OAuth da Salesforce num único Pre-request Script de collection, eliminando o copia-e-cola de tokens entre requests."
+tags: [salesforce, postman, oauth, api]
+description: "Como centralizar a obtenção e validação do token OAuth da Salesforce num único Pre-request Script de collection, eliminando o request de 'Get Token' e o copia-e-cola de tokens."
 ---
 
 ## Resumo
 
-Quem trabalha com APIs da Salesforce no Postman conhece o ritual: um request separado só para gerar o token, copiar o `access_token`, colar no header de outro request, descobrir meia hora depois que o token expirou e repetir tudo. Multiplique isso por REST, GraphQL, Bulk API, Composite e por três ambientes (DEV, UAT, PRD) e o tempo perdido deixa de ser pequeno.
+Quem trabalha com APIs da Salesforce no Postman conhece o ritual: um request separado só para gerar o token, copiar o `access_token`, colar no header de outro request, descobrir meia hora depois que o token expirou e repetir tudo. Multiplique isso por REST, GraphQL, Bulk API e Composite, e por três ambientes, e o tempo perdido deixa de ser pequeno.
 
-Este artigo propõe um padrão simples: **um único Pre-request Script no nível da collection** que obtém o token via OAuth 2.0 Client Credentials, valida se ele ainda está ativo na própria Salesforce e só gera um novo quando necessário. Todos os requests da collection herdam a autenticação. Nenhum request de "login" precisa ser executado manualmente.
-
-No final, a collection é versionada no Git com o Native Git do Postman e executada em CI com o Postman CLI, sem nenhuma credencial no repositório.
+Este artigo propõe um padrão simples: **um único Pre-request Script no nível da collection** que obtém o token via OAuth 2.0 Client Credentials, valida se ele ainda está ativo na própria Salesforce e só gera um novo quando necessário. Todos os requests herdam a autenticação. Nenhum request de "login" precisa ser executado manualmente.
 
 ---
 
 ## 1. O problema
 
-A abordagem mais comum em times que consomem APIs Salesforce é ter, dentro da collection, um request chamado algo como `00 - Get Token`. O fluxo fica assim:
+A abordagem mais comum é ter, dentro da collection, um request chamado algo como `00 - Get Token`. O fluxo fica assim:
 
 1. Executar `Get Token` manualmente.
 2. Um script de teste salva o `access_token` numa variável.
@@ -30,11 +28,21 @@ A abordagem mais comum em times que consomem APIs Salesforce é ter, dentro da c
 Os problemas desse modelo:
 
 - **Dependência de ordem de execução.** Quem abre a collection pela primeira vez não sabe que precisa rodar o request de token antes.
-- **Expiração invisível.** O timeout de sessão é configurado na org (Session Settings) e pode ser revogado a qualquer momento. O Postman não sabe disso.
+- **Expiração invisível.** O timeout de sessão é configurado na org e a sessão pode ser revogada a qualquer momento. O Postman não sabe disso.
 - **Duplicação.** Cada pasta ou collection acaba com seu próprio request de token, cada um com uma variação diferente.
-- **Atrito em CI.** No pipeline, é preciso garantir que o request de token rode primeiro, o que acopla a ordem dos testes à autenticação.
+- **Runner frágil.** Para rodar a collection inteira, o request de token precisa ser o primeiro, o que acopla a ordem dos testes à autenticação.
 
-## 2. A proposta
+## 2. Por que não usar o OAuth 2.0 nativo do Postman?
+
+É a primeira pergunta razoável. O Postman tem um tipo de autorização **OAuth 2.0** com suporte a Client Credentials, e para muitos provedores ele resolve bem. Com a Salesforce, esbarra em três limitações:
+
+- **Sem renovação automática.** O auto-refresh do Postman depende de um *refresh token*, e o fluxo Client Credentials da Salesforce não emite um. Quando o token expira, alguém precisa clicar em *Get New Access Token*.
+- **Não detecta sessão revogada.** O helper não consulta a Salesforce para saber se o token ainda vale. Se a sessão cair antes do esperado, o primeiro sinal é um `401` no meio do trabalho.
+- **O `instance_url` fica de fora.** A resposta do token da Salesforce traz a URL da instância, que é a base correta para as chamadas seguintes. O helper nativo não expõe esse valor de forma simples como variável.
+
+O Pre-request Script resolve as três com poucas linhas de JavaScript, sem perder a configuração centralizada.
+
+## 3. A proposta
 
 Mover toda a responsabilidade de autenticação para o **Pre-request Script da collection**. O Postman executa esse script automaticamente antes de **cada** request da collection, então qualquer request, executado em qualquer ordem, sempre sai com um token válido.
 
@@ -44,7 +52,7 @@ Request disparado
       ▼
 Pre-request da collection
       │
-      ├── Existe token em cache e foi validado há pouco? ──► segue
+      ├── Existe token e foi validado há pouco? ──► segue
       │
       ├── Existe token? ──► GET /services/oauth2/userinfo
       │                         ├── 200 ──► marca validado, segue
@@ -59,11 +67,11 @@ Request sai com Authorization: Bearer {{sf_access_token}}
 
 Três decisões de design sustentam esse fluxo:
 
-1. **Validação na fonte, não por relógio.** Em vez de assumir que o token vale por X minutos, o script pergunta à Salesforce. Isso cobre sessões revogadas, políticas de timeout diferentes por org e tokens invalidados por troca de senha ou de configuração do app.
-2. **Janela de validação.** Chamar o `userinfo` antes de todo request dobraria o número de chamadas. O script só revalida se a última validação tiver mais de alguns minutos. Dentro da janela, confia no cache.
+1. **Validação na fonte, não por relógio.** Em vez de assumir que o token vale por X minutos, o script pergunta à Salesforce. Isso cobre sessões revogadas, políticas de timeout diferentes por org e tokens invalidados por mudanças no app.
+2. **Janela de validação.** Chamar o `userinfo` antes de todo request dobraria o número de chamadas. O script só revalida se a última validação tiver mais de alguns minutos.
 3. **Ambiente parametrizado.** O mesmo script serve para DEV, UAT e PRD. Uma única variável (`sf_env`) define de onde vêm as credenciais.
 
-## 3. Pré-requisitos na Salesforce
+## 4. Pré-requisitos na Salesforce
 
 O fluxo Client Credentials exige um app de integração configurado na org:
 
@@ -71,9 +79,9 @@ O fluxo Client Credentials exige um app de integração configurado na org:
 - Um usuário definido em **Run As**. Toda chamada feita com o token roda com as permissões desse usuário, então use um usuário de integração com o mínimo de acesso necessário.
 - Os scopes adequados para o que a collection vai consumir (no mínimo `api`).
 
-Um detalhe que costuma custar tempo: o Client Credentials Flow **exige a URL do My Domain** da org. Chamar `login.salesforce.com` ou `test.salesforce.com` retorna erro.
+O Client Credentials Flow **exige a URL do My Domain** da org. Chamar `login.salesforce.com` ou `test.salesforce.com` retorna erro (veja a seção 8).
 
-## 4. Variáveis de ambiente
+## 5. Variáveis de ambiente
 
 Cada environment do Postman define o prefixo do ambiente e as credenciais correspondentes:
 
@@ -81,8 +89,8 @@ Cada environment do Postman define o prefixo do ambiente e as credenciais corres
 |---|---|---|
 | `sf_env` | `uat` | Prefixo usado para buscar as demais |
 | `uat_url` | `https://suaorg--uat.sandbox.my.salesforce.com` | My Domain da org |
-| `uat_key` | *(vazio no repositório)* | Consumer Key |
-| `uat_sec` | *(vazio no repositório)* | Consumer Secret |
+| `uat_key` | | Consumer Key |
+| `uat_sec` | | Consumer Secret |
 | `Version` | `v62.0` | Versão da API |
 
 O script cria e mantém sozinho estas três:
@@ -95,7 +103,7 @@ O script cria e mantém sozinho estas três:
 
 Para adicionar PRD, basta um novo environment com `sf_env = prd` e as variáveis `prd_url`, `prd_key` e `prd_sec`. O script não muda.
 
-## 5. O script
+## 6. O script
 
 Cole no Pre-request Script da **collection** (não do request):
 
@@ -185,11 +193,15 @@ await garantirToken();
 
 É o endpoint mais barato para checar um token: responde rápido, retorna `401` quando a sessão não é mais válida e não depende de nenhum objeto ou permissão específica. Funciona como um "ping autenticado".
 
-### Trocando ambiente
+### Por que a janela de validação
 
-Como o token fica salvo no environment, trocar de UAT para PRD no seletor do Postman troca automaticamente o conjunto `sf_access_token` / `sf_instance_url`. Não há risco de mandar um token de UAT para PRD.
+Para uso interativo, 5 minutos é confortável: o token é revalidado poucas vezes por hora. Para o Collection Runner com centenas de requests, uma janela maior reduz ainda mais as chamadas ao `userinfo`. Se o token cair dentro da janela, o request recebe `401` e a próxima revalidação gera um novo.
 
-## 6. Configurando os requests
+### Trocando de ambiente
+
+O token fica salvo no próprio environment. Trocar de UAT para PRD no seletor do Postman troca junto o `sf_access_token` e o `sf_instance_url`, sem risco de mandar um token de UAT para PRD.
+
+## 7. Configurando os requests
 
 Com o script na collection, os requests ficam limpos.
 
@@ -199,7 +211,7 @@ Com o script na collection, os requests ficam limpos.
 - Token: `{{sf_access_token}}`
 - *Apply Auth to*: o domínio da org, por exemplo `*.my.salesforce.com/*`. Esse campo impede que o token seja enviado se algum request apontar para um host fora da Salesforce.
 
-**Em cada request**, aba *Authorization*: **Inherit auth from parent**.
+**Em cada request**, aba *Authorization*: **Inherit auth from parent**. Se a opção não aparecer, o request está solto, fora de uma collection ou pasta.
 
 **URLs** sempre a partir da instância retornada pela Salesforce:
 
@@ -249,91 +261,40 @@ pm.test("Sem erros GraphQL", () =>
 );
 ```
 
-Sem esse teste, um request quebrado passa como verde no runner e no CI.
+## 8. Troubleshooting
 
-## 7. Versionando a collection
+Como o script repassa o `error` e o `error_description` da Salesforce, a mensagem aparece direto no Console do Postman. Os casos mais comuns:
 
-Com o Native Git do Postman (v12+), a collection deixa de viver só na nuvem e passa a ser um conjunto de arquivos YAML dentro do repositório. Ao conectar o workspace a uma pasta, o Postman cria:
-
-| Pasta | Conteúdo | Versionar |
+| Erro | Causa provável | Como resolver |
 |---|---|---|
-| `postman/` | Collections e environments em YAML | Sim |
-| `.postman/resources.yaml` | Mapa entre arquivos locais e IDs no Postman Cloud | Sim |
+| `unsupported_grant_type` / *request not supported on this domain* | Chamada para `login.salesforce.com` ou `test.salesforce.com` | Usar a URL do My Domain em `{env}_url` |
+| `invalid_grant` / *no client credentials user enabled* | Usuário *Run As* não definido no app | Configurar o *Run As* nas políticas do app |
+| `invalid_client_id` | Consumer Key errada ou de outra org | Conferir a chave e se o app pertence à org de `{env}_url` |
+| `invalid_client` / *invalid client credentials* | Consumer Secret errado, ou app recém-criado ainda propagando | Conferir o secret; em apps novos, aguardar alguns minutos |
+| `401 INVALID_SESSION_ID` na chamada da API | Token caiu dentro da janela de validação | Reexecutar; a próxima revalidação gera um token novo |
+| Erro "Defina uat_url, uat_key..." | Environment errado selecionado ou `sf_env` com outro prefixo | Conferir o environment ativo e o valor de `sf_env` |
 
-O fluxo de trabalho vira o mesmo do código:
+## 9. Antes e depois
 
-```bash
-git checkout -b feature/novo-endpoint
-# edita a collection no Postman, em Local View
-git add postman/ .postman/
-git commit -m "Adiciona request de consulta de Case"
-git push -u origin feature/novo-endpoint
-```
+| | Com `00 - Get Token` | Com Pre-request na collection |
+|---|---|---|
+| Primeiro uso | Descobrir que precisa rodar o request de token | Só executar o request desejado |
+| Token expirou | `401`, rodar o token de novo, repetir o request | Transparente |
+| Sessão revogada | `401` sem explicação | Detectado na revalidação, novo token gerado |
+| Trocar de ambiente | Rodar o token no novo ambiente | Trocar o environment no seletor |
+| Collection Runner | Request de token obrigatoriamente primeiro | Qualquer ordem, qualquer subconjunto |
+| Novo request | Configurar header de auth | *Inherit auth from parent* |
 
-O Pre-request Script vai junto no arquivo de definição da collection, então quem clonar o repositório já recebe a autenticação pronta.
-
-### Credenciais fora do repositório
-
-Os environments também viram arquivos. A regra é: **as chaves vão para o Git, os valores não.** Antes de cada commit:
-
-```bash
-grep -rnE "_key|_sec|sf_access_token" postman/environments/
-```
-
-Se aparecer qualquer valor preenchido, limpe no environment ou mova o segredo para o **Postman Vault** antes do `git add`.
-
-## 8. Executando em CI
-
-O Postman CLI roda a mesma collection no pipeline. As credenciais entram como secrets do CI, injetadas em tempo de execução:
-
-```yaml
-name: Salesforce API Tests
-
-on:
-  pull_request:
-    paths: ["postman/**"]
-
-jobs:
-  api-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Instalar Postman CLI
-        run: curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
-
-      - name: Rodar collection em UAT
-        env:
-          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
-          UAT_KEY: ${{ secrets.SF_UAT_KEY }}
-          UAT_SEC: ${{ secrets.SF_UAT_SEC }}
-        run: |
-          postman login --with-api-key "$POSTMAN_API_KEY"
-          postman collection run postman/collections/Salesforce \
-            -e postman/environments/UAT.yaml \
-            --env-var "uat_key=$UAT_KEY" \
-            --env-var "uat_sec=$UAT_SEC"
-```
-
-Repare que o pipeline **não tem nenhum passo de autenticação na Salesforce**. O Pre-request Script cuida disso na primeira chamada, exatamente como na máquina do desenvolvedor.
-
-> O Newman não é compatível com o formato v3 de collections usado pelo Native Git. Pipelines antigos que usam `newman run` precisam migrar para o Postman CLI.
-
-## 9. Boas práticas e armadilhas
+## 10. Boas práticas
 
 - **Script na collection, nunca no request.** Script no request reintroduz a duplicação que este padrão quer eliminar.
 - **Usuário de integração com menor privilégio.** O token herda todas as permissões do usuário *Run As*. Um token vazado de um admin é um incidente; de um usuário restrito, é um incômodo.
-- **My Domain sempre.** `test.salesforce.com` não funciona com Client Credentials.
-- **Não edite em Cloud View.** Com Native Git, alterações feitas direto na nuvem são sobrescritas no próximo `postman workspace push`.
-- **Ajuste a janela de validação ao uso.** Para uso interativo, 5 minutos é confortável. Para runners com centenas de requests, uma janela maior reduz chamadas ao `userinfo`; o `401` ainda é tratado na próxima revalidação.
+- **Credenciais fora de qualquer arquivo compartilhado.** Ao exportar ou versionar a collection, mantenha `{env}_key`, `{env}_sec` e `sf_access_token` com valores vazios, ou use o Postman Vault.
+- **Sempre `sf_instance_url` nas URLs.** Ela vem da própria Salesforce e evita chamar um host diferente daquele que emitiu o token.
 - **Teste `errors` em GraphQL.** Status 200 não significa sucesso.
 
-## 10. Conclusão
+## Conclusão
 
-Centralizar a autenticação num Pre-request Script de collection resolve um problema pequeno que se repete o dia inteiro. O ganho não está só nos segundos economizados por request: está em ter uma collection que **funciona na primeira execução**, em qualquer ordem, em qualquer ambiente, na máquina de qualquer pessoa do time e no pipeline, sem nenhuma instrução extra.
+Centralizar a autenticação num Pre-request Script de collection resolve um problema pequeno que se repete o dia inteiro. O ganho não está só nos segundos economizados por request: está em ter uma collection que **funciona na primeira execução**, em qualquer ordem e em qualquer ambiente, na máquina de qualquer pessoa do time.
 
-Combinado ao Native Git, o resultado é uma collection tratada como código: versionada, revisada em PR, testada em CI e sem nenhum segredo no repositório.
-
----
-
-*Código completo e collection de exemplo: [github.com/andrelpcarvalho/salesforcce-collections](https://github.com/andrelpcarvalho/salesforcce-collections)*
+No próximo post, essa mesma collection vai para o Git e entra no pipeline do GitHub Actions como smoke test das APIs depois de cada deploy na Salesforce.
